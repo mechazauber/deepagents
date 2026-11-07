@@ -2603,6 +2603,18 @@ _STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
         # value is never printed — `config` reports source and presence only.
         redacted=True,
     ),
+    ConfigOption(
+        key="agent.repeated_call_threshold",
+        group="Agents",
+        summary=(
+            "Nudge the agent after this many consecutive identical tool "
+            "calls (0 disables; default 3)."
+        ),
+        kind=OptionKind.NON_NEGATIVE_INT,
+        default=3,
+        env_var=_env_vars.REPEATED_CALL_THRESHOLD,
+        toml_keys=("agent", "repeated_call_threshold"),
+    ),
     # --- Sandboxes ------------------------------------------------------
     ConfigOption(
         key="sandboxes.default",

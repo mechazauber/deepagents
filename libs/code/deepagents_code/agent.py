@@ -3529,6 +3529,21 @@ def create_cli_agent(
 
     agent_middleware.append(compaction_middleware)
 
+    # Repeated-tool-call detector: nudge the agent when it calls the same
+    # tool with the same arguments `threshold` times in a row.
+    from deepagents_code.config_manifest import get_option
+    from deepagents_code.configuration.resolver import get_config_resolver
+    from deepagents_code.repeated_tool_call import RepeatedToolCallMiddleware
+
+    _rcc_option = get_option("agent.repeated_call_threshold")
+    _rcc_threshold = (
+        get_config_resolver().get(_rcc_option).value if _rcc_option else 3
+    )
+    if isinstance(_rcc_threshold, int) and _rcc_threshold >= 2:
+        agent_middleware.append(
+            RepeatedToolCallMiddleware(threshold=_rcc_threshold)
+        )
+
     # Model-node retry sits inside side-effecting automatic compaction so a
     # failed provider attempt repeats only the final model handler, not summary
     # generation or the archive append. Keep it in the stack when the startup
