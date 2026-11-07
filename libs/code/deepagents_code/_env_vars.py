@@ -574,6 +574,14 @@ are ignored with a logged warning, falling back to `config.toml`. See
 `[runtime].recursion_limit` and the `--recursion-limit` CLI flag.
 """
 
+REPEATED_CALL_THRESHOLD = "DEEPAGENTS_CODE_REPEATED_CALL_THRESHOLD"
+"""Number of consecutive identical tool calls before the agent is nudged.
+
+Parsed as a non-negative integer. `0` disables the detector. Values below 2
+are ignored in favor of the next config source. Also settable via
+`[agent].repeated_call_threshold` in config.toml.
+"""
+
 RESTARTED_AFTER_UPDATE = "DEEPAGENTS_CODE_RESTARTED_AFTER_UPDATE"
 """Internal sentinel recording the target version immediately before the
 startup auto-update re-execs the process.
