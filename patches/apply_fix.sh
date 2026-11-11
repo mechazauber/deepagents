@@ -95,8 +95,77 @@ PY
 
 # Verify the fix
 echo
-echo "Verifying fix..."
+echo "Verifying _engine.py fix..."
 grep -c "getattr(_CUR" "$ENGINE" | xargs -I{} echo "  {} null-checks found (expected 4)"
 
+# --- Part 2: context.py thread affinity ---
+CONTEXT="${TARGET}/quickjs_rs/context.py"
+if [[ ! -f "$CONTEXT" ]]; then
+  echo "WARNING: $CONTEXT not found — skipping context.py fix" >&2
+  exit 0
+fi
+
+# Check if already patched
+if grep -q "_on_wasmtime_thread" "$CONTEXT" 2>/dev/null; then
+  echo "  context.py already patched (found _on_wasmtime_thread)"
+else
+  cp "$CONTEXT" "${CONTEXT}.bak"
+  echo "Applying context.py thread-affinity fix..."
+  # Apply the unified diff (strip the header, use patch -p1)
+  PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PATCH_FILE="${PATCH_DIR}/fix-quickjs-wasmtime-thread-affinity.patch"
+  if [[ ! -f "$PATCH_FILE" ]]; then
+    echo "ERROR: $PATCH_FILE not found" >&2
+    exit 1
+  fi
+  # Extract the diff portion (skip the # header lines)
+  python3 - "$PATCH_FILE" "$CONTEXT" <<'PY2'
+import difflib, sys
+
+patch_path, target_path = sys.argv[1], sys.argv[2]
+with open(patch_path) as f:
+    content = f.read()
+idx = content.find('--- a/quickjs_rs/context.py')
+if idx == -1:
+    print("ERROR: could not find diff header in patch")
+    sys.exit(1)
+diff_text = content[idx:]
+
+with open(target_path) as f:
+    original = f.readlines()
+
+# Apply the unified diff
+import subprocess
+result = subprocess.run(
+    ['patch', '-p1', '--batch', '-o', target_path],
+    input=diff_text,
+    capture_output=True,
+    text=True,
+    cwd=target_path.rsplit('/', 1)[0],
+)
+# patch -p1 with -o writes to stdout; redirect properly
+# Actually use patch with the file in place:
+result = subprocess.run(
+    ['patch', '-p1', '--batch'],
+    input=diff_text,
+    capture_output=True,
+    text=True,
+    cwd=target_path.rsplit('/', 1)[0],
+)
+if result.returncode != 0:
+    print(f"patch failed: {result.stderr}")
+    sys.exit(1)
+print(f"  context.py patched: {result.stdout.strip()}")
+PY2
+  if [[ $? -ne 0 ]]; then
+    echo "ERROR: context.py patch failed" >&2
+    exit 1
+  fi
+fi
+
 echo
-echo "Done. Restart dcode to pick up the fix."
+echo "Verifying context.py fix..."
+grep -c "_on_wasmtime_thread" "$CONTEXT" | xargs -I{} echo "  {} _on_wasmtime_thread references found (expected >=10)"
+
+echo
+echo "Done. Restart dcode to pick up both fixes."
