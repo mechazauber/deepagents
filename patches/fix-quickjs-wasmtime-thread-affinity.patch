@@ -1,0 +1,410 @@
+# Patch: fix quickjs_rs Wasmtime thread affinity (complements the _engine.py fix)
+#
+# Target: quickjs_rs/context.py (PyPI package quickjs-rs==0.2.6)
+#
+# The _engine.py fix (fix-quickjs-wasmtime-cross-thread-crash.patch) prevents
+# the trampoline from crashing when _CUR.inst is None. But it does NOT fix
+# the underlying problem: the Wasmtime Store is NOT thread-safe. When a
+# js_eval script calls task(), the subagent's Wasmtime work runs on a
+# different thread (the outer LangGraph loop). Any Store access from that
+# thread (resolve_pending, reject_pending, eval, etc.) raises
+# WasmtimeError: An internal error occurred.
+#
+# This patch adds thread affinity to quickjs_rs/context.py:
+#   - _wasmtime_affinity: the thread that created the context (first to touch
+#     the store).
+#   - _on_wasmtime_thread(fn): if the caller is on the affinity thread, run
+#     fn() inline (zero overhead). Otherwise, serialize fn() onto a single
+#     persistent affinity thread via a queue, so the store is always touched
+#     by exactly ONE OS thread for its lifetime.
+#   - All Store access points in Context are wrapped with _on_wasmtime_thread.
+#
+# How to apply:
+#   cd <your-dcode-install>/lib/python3.14/site-packages
+#   patch -p1 < /path/to/fix-quickjs-wasmtime-thread-affinity.patch
+#
+# NOTE: apply the _engine.py patch FIRST (it is a prerequisite — without it,
+# the trampolines crash before the affinity hop can take effect).
+
+--- a/quickjs_rs/context.py
++++ b/quickjs_rs/context.py
+@@ -4,6 +4,8 @@
+ 
+ import asyncio
+ import inspect
++import queue
++import threading
+ import time
+ from collections.abc import Callable
+ from types import TracebackType
+@@ -97,6 +99,27 @@
+             raise QuickJSError(str(e)) from e
+         self._timeout = timeout
+         self._closed = False
++        # Wasmtime affinity. The engine's Store is NOT thread-safe:
++        # every wasm call (exports, memory, globals) must run on ONE
++        # OS thread. The QuickJS host call fires re-entrantly from
++        # whichever thread the driving loop runs on, and the driving
++        # loop can move to another thread (e.g. the Deep Agents
++        # `task()` bridge awaits on the parent LangGraph loop via
++        # run_coroutine_threadsafe), so pinning to the *current*
++        # thread is not enough. Capture the thread that first touched
++        # the store (context creation) and hop every store access
++        # back onto it. Same-thread access is a zero-cost no-op.
++        #
++        # If the driving loop migrates to a different thread, a
++        # single persistent "affinity thread" is created (lazily, on
++        # first cross-thread call) and ALL subsequent store access —
++        # from any thread — is serialized onto it via a queue. This
++        # keeps the store on exactly one thread for its lifetime,
++        # which is what wasmtime requires.
++        self._wasmtime_affinity: threading.Thread | None = threading.current_thread()
++        self._affinity_thread: threading.Thread | None = None
++        self._affinity_queue: "queue.Queue[tuple[Callable[[], Any], list[Any], list[BaseException], threading.Event]]" | None = None
++        self._wasmtime_affinity_lock = threading.Lock()
+         # The globals proxy holds a QjsHandle to globalThis. Built
+         # lazily so a context created solely for eval() with no
+         # globals access doesn't pay for the handle allocation.
+@@ -142,7 +165,7 @@
+         if self._closed:
+             raise QuickJSError("context is closed")
+         if self._globals is None:
+-            engine_handle = self._engine_ctx.global_object()
++            engine_handle = self._on_wasmtime_thread(self._engine_ctx.global_object)
+             self._globals = Globals(self, Handle(self, engine_handle))
+         return self._globals
+ 
+@@ -167,7 +190,9 @@
+         if self._globals is not None:
+             self._globals._handle.dispose()
+             self._globals = None
+-        self._engine_ctx.close()
++        # Store access — hop onto the owning thread (no-op when the
++        # caller is already on it, which is the normal case).
++        self._on_wasmtime_thread(self._engine_ctx.close)
+         self._runtime._unregister_context(self)
+         self._closed = True
+ 
+@@ -208,35 +233,38 @@
+         if self._closed:
+             raise QuickJSError("context is closed")
+ 
+-        self._last_host_exception = None
+-        self._engine_ctx.take_sync_eval_hit_async_call()
+-        self._engine_ctx.set_in_sync_eval(True)
+-        deadline = time.monotonic() + self._timeout
+-        self._runtime._deadline = deadline
+-        inner: _engine.QjsHandle
+-        try:
+-            inner = self._engine_ctx.eval_handle(
+-                code,
+-                module=module,
+-                strict=strict,
+-                filename=filename,
+-                transform_flags=transform_flags,
+-            )
+-        except _engine.JSError as e:
+-            name, message, stack = e.args
++        def _run() -> Handle:
++            self._last_host_exception = None
++            self._engine_ctx.take_sync_eval_hit_async_call()
++            self._engine_ctx.set_in_sync_eval(True)
++            deadline = time.monotonic() + self._timeout
++            self._runtime._deadline = deadline
++            inner: _engine.QjsHandle
++            try:
++                inner = self._engine_ctx.eval_handle(
++                    code,
++                    module=module,
++                    strict=strict,
++                    filename=filename,
++                    transform_flags=transform_flags,
++                )
++            except _engine.JSError as e:
++                name, message, stack = e.args
++                if self._engine_ctx.take_sync_eval_hit_async_call():
++                    raise sync_eval_handle_async_call_error() from None
++                self._raise_classified(name, message, stack, deadline)
++            except _engine.MarshalError as e:
++                if self._engine_ctx.take_sync_eval_hit_async_call():
++                    raise sync_eval_handle_async_call_error() from None
++                raise MarshalError(str(e)) from None
++            finally:
++                self._engine_ctx.set_in_sync_eval(False)
++                self._runtime._deadline = None
+             if self._engine_ctx.take_sync_eval_hit_async_call():
+-                raise sync_eval_handle_async_call_error() from None
+-            self._raise_classified(name, message, stack, deadline)
+-        except _engine.MarshalError as e:
+-            if self._engine_ctx.take_sync_eval_hit_async_call():
+-                raise sync_eval_handle_async_call_error() from None
+-            raise MarshalError(str(e)) from None
+-        finally:
+-            self._engine_ctx.set_in_sync_eval(False)
+-            self._runtime._deadline = None
+-        if self._engine_ctx.take_sync_eval_hit_async_call():
+-            raise sync_eval_handle_async_call_error()
+-        return Handle(self, inner)
++                raise sync_eval_handle_async_call_error()
++            return Handle(self, inner)
++
++        return self._on_wasmtime_thread(_run)
+ 
+     def eval(
+         self,
+@@ -258,51 +286,54 @@
+         if self._closed:
+             raise QuickJSError("context is closed")
+ 
+-        # Clear the side channel at each sync-eval entry so a
+-        # swallowed raise from an earlier eval can't attach itself as
+-        # __cause__ on an unrelated later HostError. Preserves the
+-        # implementation tripwire test_swallowed_host_raise_does_not_leak_cause.
+-        self._last_host_exception = None
+-        # Clear any stale sync-eval-hit-async-call flag left
+-        # from a prior eval that itself raised before consuming it.
+-        self._engine_ctx.take_sync_eval_hit_async_call()
+-        self._engine_ctx.set_in_sync_eval(True)
+-
+-        deadline = time.monotonic() + self._timeout
+-        self._runtime._deadline = deadline
+-        result: Any
+-        try:
+-            result = self._engine_ctx.eval(
+-                code,
+-                module=module,
+-                strict=strict,
+-                filename=filename,
+-                transform_flags=transform_flags,
+-            )
+-        except _engine.JSError as e:
+-            name, message, stack = e.args
+-            # If an async host fn fired during this sync eval,
+-            # the user's real bug is "sync eval on a context with
+-            # async host fns". Surface that instead of whatever
+-            # downstream error the async-rejected promise produced.
++        def _run() -> Any:
++            # Clear the side channel at each sync-eval entry so a
++            # swallowed raise from an earlier eval can't attach itself as
++            # __cause__ on an unrelated later HostError. Preserves the
++            # implementation tripwire test_swallowed_host_raise_does_not_leak_cause.
++            self._last_host_exception = None
++            # Clear any stale sync-eval-hit-async-call flag left
++            # from a prior eval that itself raised before consuming it.
++            self._engine_ctx.take_sync_eval_hit_async_call()
++            self._engine_ctx.set_in_sync_eval(True)
++
++            deadline = time.monotonic() + self._timeout
++            self._runtime._deadline = deadline
++            result: Any
++            try:
++                result = self._engine_ctx.eval(
++                    code,
++                    module=module,
++                    strict=strict,
++                    filename=filename,
++                    transform_flags=transform_flags,
++                )
++            except _engine.JSError as e:
++                name, message, stack = e.args
++                # If an async host fn fired during this sync eval,
++                # the user's real bug is "sync eval on a context with
++                # async host fns". Surface that instead of whatever
++                # downstream error the async-rejected promise produced.
++                if self._engine_ctx.take_sync_eval_hit_async_call():
++                    raise sync_eval_async_call_error() from None
++                self._raise_classified(name, message, stack, deadline)
++            except _engine.MarshalError as e:
++                if self._engine_ctx.take_sync_eval_hit_async_call():
++                    raise sync_eval_async_call_error() from None
++                raise MarshalError(str(e)) from None
++            finally:
++                self._engine_ctx.set_in_sync_eval(False)
++                self._runtime._deadline = None
++
++            # Normal return: still check the flag. An async host fn that
++            # fired and whose rejection was caught by JS wouldn't raise,
++            # but it's still a bug — the user's code ignored an async-
++            # host result.
+             if self._engine_ctx.take_sync_eval_hit_async_call():
+-                raise sync_eval_async_call_error() from None
+-            self._raise_classified(name, message, stack, deadline)
+-        except _engine.MarshalError as e:
+-            if self._engine_ctx.take_sync_eval_hit_async_call():
+-                raise sync_eval_async_call_error() from None
+-            raise MarshalError(str(e)) from None
+-        finally:
+-            self._engine_ctx.set_in_sync_eval(False)
+-            self._runtime._deadline = None
+-
+-        # Normal return: still check the flag. An async host fn that
+-        # fired and whose rejection was caught by JS wouldn't raise,
+-        # but it's still a bug — the user's code ignored an async-
+-        # host result.
+-        if self._engine_ctx.take_sync_eval_hit_async_call():
+-            raise sync_eval_async_call_error()
+-        return result
++                raise sync_eval_async_call_error()
++            return result
++
++        return self._on_wasmtime_thread(_run)
+ 
+     def create_snapshot(self) -> Snapshot:
+         """Capture a snapshot of this context.
+@@ -325,7 +356,7 @@
+             QuickJSError: If the context is closed or async host tasks pend.
+         """
+         self._assert_snapshot_quiescent()
+-        return Snapshot(self._engine_ctx.create_snapshot())
++        return Snapshot(self._on_wasmtime_thread(self._engine_ctx.create_snapshot))
+ 
+     async def create_snapshot_async(self, *, timeout: float | None = None) -> Snapshot:
+         """Async-compatible snapshot. Same capture as
+@@ -334,7 +365,7 @@
+         memory copy) — the quiescence guard ensures no async work is mid-flight.
+         """
+         self._assert_snapshot_quiescent()
+-        return Snapshot(self._engine_ctx.create_snapshot())
++        return Snapshot(self._on_wasmtime_thread(self._engine_ctx.create_snapshot))
+ 
+     def _raise_classified(
+         self,
+@@ -931,11 +962,13 @@
+         """
+         for pid in list(self._pending_tasks):
+             try:
+-                self._engine_ctx.reject_pending(
+-                    pid,
+-                    "HostCancellationError",
+-                    "eval_async was cancelled",
+-                    None,
++                self._on_wasmtime_thread(
++                    lambda _pid=pid: self._engine_ctx.reject_pending(
++                        _pid,
++                        "HostCancellationError",
++                        "eval_async was cancelled",
++                        None,
++                    )
+                 )
+             except Exception:
+                 # Best-effort: a pid may have been settled between
+@@ -968,6 +1001,12 @@
+         if self._pending_completed is None:
+             self._pending_completed = asyncio.Event()
+ 
++        # The settle step of `_run_async_host_call` touches the Wasmtime
++        # store (resolve/reject_pending), so the whole task body hops
++        # onto the store-owning thread (see `_on_wasmtime_thread`). The
++        # scheduling below stays on the calling (event-loop) thread:
++        # the loop primitives are not thread-safe, but they never
++        # touch the store.
+         coro = self._run_async_host_call(fn, args, pending_id)
+         if self._active_task_group is not None:
+             task = self._active_task_group.create_task(coro)
+@@ -1020,9 +1059,15 @@
+ 
+             try:
+                 if resolve_ok:
+-                    self._engine_ctx.resolve_pending(pending_id, value)
++                    self._on_wasmtime_thread(
++                        lambda: self._engine_ctx.resolve_pending(pending_id, value)
++                    )
+                 else:
+-                    self._engine_ctx.reject_pending(pending_id, err_name, err_message, err_stack)
++                    self._on_wasmtime_thread(
++                        lambda: self._engine_ctx.reject_pending(
++                            pending_id, err_name, err_message, err_stack
++                        )
++                    )
+             except Exception as settle_exc:
+                 # The promise was not settled. Two causes are genuinely benign:
+                 #   1. the context closed under us
+@@ -1038,8 +1083,11 @@
+                 if resolve_ok:
+                     # Retry once for potential transient failures
+                     try:
+-                        self._engine_ctx.run_pending_jobs()
+-                        self._engine_ctx.resolve_pending(pending_id, value)
++                        def _retry() -> None:
++                            self._engine_ctx.run_pending_jobs()
++                            self._engine_ctx.resolve_pending(pending_id, value)
++
++                        self._on_wasmtime_thread(_retry)
+                         settled = True
+                     except Exception:
+                         # Still can't deliver the result. Store the original
+@@ -1047,8 +1095,10 @@
+                         self._last_host_exception = settle_exc
+                 if not settled:
+                     try:
+-                        self._engine_ctx.reject_pending(
+-                            pending_id, err_name, _HOST_ERROR_SANITIZED_MESSAGE, None
++                        self._on_wasmtime_thread(
++                            lambda: self._engine_ctx.reject_pending(
++                                pending_id, err_name, _HOST_ERROR_SANITIZED_MESSAGE, None
++                            )
+                         )
+                         settled = True
+                     except Exception:
+@@ -1063,6 +1113,61 @@
+             if self._pending_completed is not None:
+                 self._pending_completed.set()
+ 
++    def _on_wasmtime_thread(self, fn: Callable[[], Any]) -> Any:
++        """Run ``fn`` on the thread that owns this context's Wasmtime
++        store, blocking until it returns.
++
++        The store is not thread-safe (see the affinity note in
++        ``__init__``): a wasm call from the wrong thread raises
++        ``WasmtimeError: An internal error occurred``. The driving
++        loop can migrate across threads (the Deep Agents `task()`
++        bridge awaits on the parent LangGraph loop via
++        ``run_coroutine_threadsafe``), so every store access hops
++        back onto the owning thread.
++
++        Same-thread calls run inline (zero overhead — the common
++        case, where the whole eval stays on the worker thread).
++        Cross-thread calls are serialized onto a single persistent
++        affinity thread via a queue, so the store is always touched
++        by exactly one OS thread for its lifetime.
++        """
++        affinity = self._wasmtime_affinity
++        if affinity is None:
++            return fn()
++        if threading.current_thread() is affinity:
++            return fn()
++        # Cross-thread: hop onto the persistent affinity thread.
++        with self._wasmtime_affinity_lock:
++            if self._affinity_thread is None or not self._affinity_thread.is_alive():
++                q: "queue.Queue[tuple[Callable[[], Any], list[Any], list[BaseException], threading.Event]]" = queue.Queue()
++                self._affinity_queue = q
++
++                def _affinity_loop() -> None:
++                    while True:
++                        item = q.get()
++                        if item is None:  # poison pill
++                            break
++                        f, box, err, done = item
++                        try:
++                            box.append(f())
++                        except BaseException as e:  # noqa: BLE001
++                            err.append(e)
++                        finally:
++                            done.set()
++
++                t = threading.Thread(target=_affinity_loop, name="quickjs-wasm-affinity", daemon=True)
++                self._affinity_thread = t
++                t.start()
++            q = self._affinity_queue
++        box: list[Any] = []
++        err: list[BaseException] = []
++        done = threading.Event()
++        q.put((fn, box, err, done))
++        done.wait()
++        if err:
++            raise err[0]
++        return box[0] if box else None
++
+     def _dispatch_host_call(self, fn_id: int, args: tuple[Any, ...]) -> Any:
+         """fn_id → callable lookup and call. Invoked from the
+         Rust trampoline with the GIL held.
