@@ -8,7 +8,9 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deepagents_code.repeated_tool_call import (
     RepeatedToolCallMiddleware,
+    _count_occurrences,
     _describe_tool_call,
+    _detect_sequence_loop,
     _tool_call_fingerprint,
 )
 
@@ -85,11 +87,32 @@ class TestConstructor:
         mw = RepeatedToolCallMiddleware()
         assert mw.threshold == 3
         assert mw.window == 10
+        assert mw.sequence_length == 5
+        assert mw.sequence_repeats == 3
 
     def test_custom_threshold(self) -> None:
         mw = RepeatedToolCallMiddleware(threshold=5, window=20)
         assert mw.threshold == 5
         assert mw.window == 20
+
+    def test_custom_sequence_params(self) -> None:
+        mw = RepeatedToolCallMiddleware(sequence_length=4, sequence_repeats=4)
+        assert mw.sequence_length == 4
+        assert mw.sequence_repeats == 4
+
+    def test_sequence_length_below_2_raises(self) -> None:
+        try:
+            RepeatedToolCallMiddleware(sequence_length=1)
+            raise AssertionError("Should have raised ValueError")
+        except ValueError as exc:
+            assert "sequence_length" in str(exc)
+
+    def test_sequence_repeats_below_2_raises(self) -> None:
+        try:
+            RepeatedToolCallMiddleware(sequence_repeats=1)
+            raise AssertionError("Should have raised ValueError")
+        except ValueError as exc:
+            assert "sequence_repeats" in str(exc)
 
     def test_threshold_below_2_raises(self) -> None:
         try:
@@ -293,3 +316,217 @@ class TestAsyncAfterModel:
         state = {"messages": [ai1]}
         result = asyncio.run(mw.aafter_model(state, runtime=None))
         assert result is None
+
+
+class TestCountOccurrences:
+    """Tests for the non-overlapping pattern counter."""
+
+    def test_no_pattern(self) -> None:
+        assert _count_occurrences(("a", "b", "c"), ("a", "b")) == 1
+        assert _count_occurrences(("a", "b", "c"), ("x",)) == 0
+
+    def test_overlapping_counted(self) -> None:
+        # "ababab" contains "ab" at positions 0, 2 and 4.
+        assert _count_occurrences(("a", "b", "a", "b", "a", "b"), ("a", "b")) == 3
+
+    def test_overlapping_triplet(self) -> None:
+        # "aaa" contains "aa" at positions 0 and 1.
+        assert _count_occurrences(("a", "a", "a"), ("a", "a")) == 2
+
+    def test_empty_pattern(self) -> None:
+        assert _count_occurrences(("a", "b"), ()) == 0
+
+    def test_pattern_longer_than_history(self) -> None:
+        assert _count_occurrences(("a",), ("a", "b")) == 0
+
+
+class TestDetectSequenceLoop:
+    """Tests for the recurring-sequence detector (pure function)."""
+
+    def test_cycling_pattern_detected(self) -> None:
+        # A-B-C repeated 3 times in the window; new A-B-C completes a 4th.
+        a, b, c = "fp_a", "fp_b", "fp_c"
+        history = (a, b, c, a, b, c, a, b, c)
+        result = _detect_sequence_loop(history, (a, b, c), 5, 3)
+        assert result is not None
+        assert result == (a, b, c)  # the 3-call pattern itself
+
+    def test_shorter_pattern_within_window(self) -> None:
+        # A-B-A-B-A-B (6 calls) with unrelated calls around it; a new
+        # A-B completes another occurrence of the 2-call pattern.
+        a, b, x = "fp_a", "fp_b", "fp_x"
+        history = (x, a, b, a, b, a, b, x)
+        result = _detect_sequence_loop(history, (a, b), 5, 3)
+        assert result == (a, b)  # the 2-call pattern itself
+
+    def test_single_call_new_not_enough(self) -> None:
+        # A single new call can never complete a sequence loop.
+        a = "fp_a"
+        history = (a, a, a, a, a)
+        assert _detect_sequence_loop(history, (a,), 5, 3) is None
+
+    def test_below_repeat_count(self) -> None:
+        # Pattern occurred only twice; 3rd occurrence not yet completed.
+        a, b, c = "fp_a", "fp_b", "fp_c"
+        history = (a, b, c, a, b, c)
+        assert _detect_sequence_loop(history, (a, b, c), 5, 3) is None
+
+    def test_exact_repetition_handled_by_threshold_not_sequence(self) -> None:
+        # 4 identical calls in a row: the 5-call pattern "aaaaa" has
+        # occurred only once, so the sequence detector must NOT fire —
+        # the exact-repetition threshold owns this case.
+        a = "fp_a"
+        history = (a, a, a, a)
+        assert _detect_sequence_loop(history, (a,), 5, 3) is None
+
+    def test_no_repetition(self) -> None:
+        history = tuple(f"fp_{i}" for i in range(10))
+        assert _detect_sequence_loop(history, ("fp_new", "fp_new2"), 5, 3) is None
+
+    def test_insufficient_history(self) -> None:
+        a, b = "fp_a", "fp_b"
+        assert _detect_sequence_loop((a, b), (a, b), 5, 3) is None
+
+
+def _sequence_messages(
+    plan: list[tuple[str, dict[str, object]]],
+) -> list[object]:
+    """Build AIMessage/ToolMessage pairs for a list of (name, args) calls."""
+    messages: list[object] = []
+    for i, (name, args) in enumerate(plan):
+        call_id = f"s{i}"
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[{"id": call_id, "name": name, "args": args}],
+            )
+        )
+        messages.append(ToolMessage(content="ok", tool_call_id=call_id, name=name))
+    return messages
+
+
+class TestAfterModelSequence:
+    """Tests for sequence-loop detection through after_model."""
+
+    def test_cycling_loop_nudged(self) -> None:
+        """A-B-C repeated 3 times, then A-B-C again → nudge on 3rd turn."""
+        mw = RepeatedToolCallMiddleware()
+        a = ("read_file", {"file_path": "/a.txt"})
+        b = ("read_file", {"file_path": "/b.txt"})
+        c = ("read_file", {"file_path": "/c.txt"})
+        # 9 executed calls: A-B-C three times.
+        messages = _sequence_messages([a, b, c, a, b, c, a, b, c])
+        # New turn: A-B-C again.
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "n1", "name": a[0], "args": a[1]},
+                    {"id": "n2", "name": b[0], "args": b[1]},
+                    {"id": "n3", "name": c[0], "args": c[1]},
+                ],
+            )
+        )
+        result = mw.after_model({"messages": messages}, runtime=None)
+        assert result is not None
+        assert result["jump_to"] == "model"
+        content = result["messages"][0].content
+        assert "sequence" in content
+        assert "3 times" in content
+        # The nudge describes the pattern with readable call names.
+        assert "read_file" in content
+
+    def test_cycling_loop_not_nudged_before_third_occurrence(self) -> None:
+        """A-B-C twice + new A-B-C → only 2nd completion, no nudge."""
+        mw = RepeatedToolCallMiddleware()
+        a = ("read_file", {"file_path": "/a.txt"})
+        b = ("read_file", {"file_path": "/b.txt"})
+        c = ("read_file", {"file_path": "/c.txt"})
+        messages = _sequence_messages([a, b, c, a, b, c])
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "n1", "name": a[0], "args": a[1]},
+                    {"id": "n2", "name": b[0], "args": b[1]},
+                    {"id": "n3", "name": c[0], "args": c[1]},
+                ],
+            )
+        )
+        result = mw.after_model({"messages": messages}, runtime=None)
+        assert result is None
+
+    def test_two_call_cycle_nudged(self) -> None:
+        """A-B repeated 3 times, then A-B again → nudge."""
+        mw = RepeatedToolCallMiddleware()
+        a = ("ls", {"path": "/x"})
+        b = ("ls", {"path": "/y"})
+        messages = _sequence_messages([a, b, a, b, a, b])
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "n1", "name": a[0], "args": a[1]},
+                    {"id": "n2", "name": b[0], "args": b[1]},
+                ],
+            )
+        )
+        result = mw.after_model({"messages": messages}, runtime=None)
+        assert result is not None
+        assert "sequence of 2" in result["messages"][0].content
+
+    def test_distinct_calls_no_nudge(self) -> None:
+        """10 distinct calls followed by 2 more distinct → no nudge."""
+        mw = RepeatedToolCallMiddleware()
+        plan = [("read_file", {"file_path": f"/f{i}.txt"}) for i in range(10)]
+        messages = _sequence_messages(plan)
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "n1", "name": "read_file", "args": {"file_path": "/g1.txt"}},
+                    {"id": "n2", "name": "read_file", "args": {"file_path": "/g2.txt"}},
+                ],
+            )
+        )
+        result = mw.after_model({"messages": messages}, runtime=None)
+        assert result is None
+
+    def test_sequence_detection_needs_enough_history(self) -> None:
+        """Fewer than `sequence_length` executed calls → no sequence check."""
+        mw = RepeatedToolCallMiddleware()
+        a = ("ls", {"path": "/x"})
+        b = ("ls", {"path": "/y"})
+        # 4 executed calls (below sequence_length=5): A-B-A-B.
+        messages = _sequence_messages([a, b, a, b])
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "n1", "name": a[0], "args": a[1]},
+                    {"id": "n2", "name": b[0], "args": b[1]},
+                ],
+            )
+        )
+        result = mw.after_model({"messages": messages}, runtime=None)
+        assert result is None
+
+    def test_nudge_lc_source(self) -> None:
+        mw = RepeatedToolCallMiddleware()
+        a = ("ls", {"path": "/x"})
+        b = ("ls", {"path": "/y"})
+        c = ("ls", {"path": "/z"})
+        messages = _sequence_messages([a, b, c, a, b, c, a, b, c])
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "n1", "name": a[0], "args": a[1]},
+                    {"id": "n2", "name": b[0], "args": b[1]},
+                    {"id": "n3", "name": c[0], "args": c[1]},
+                ],
+            )
+        )
+        result = mw.after_model({"messages": messages}, runtime=None)
+        assert result is not None
+        assert result["messages"][0].additional_kwargs["lc_source"] == "repeated_tool_call"
