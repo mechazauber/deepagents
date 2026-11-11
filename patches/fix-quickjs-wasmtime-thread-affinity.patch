@@ -512,10 +512,24 @@
                          )
                          settled = True
                      except Exception:
-@@ -1063,6 +1147,61 @@
+@@ -1063,6 +1147,86 @@
              if self._pending_completed is not None:
                  self._pending_completed.set()
  
++    def _affinity_caller(self) -> str:
++        """Best-effort caller frame for the affinity debug log."""
++        try:
++            import traceback
++
++            frames = traceback.extract_stack()
++            # Skip this frame + the _on_wasmtime_thread frame.
++            if len(frames) >= 3:
++                f = frames[-3]
++                return f"{f.filename}:{f.lineno} in {f.name}"
++        except Exception:
++            pass
++        return "?"
++
 +    def _on_wasmtime_thread(self, fn: Callable[[], Any]) -> Any:
 +        """Run ``fn`` on the thread that owns this context's Wasmtime
 +        store, blocking until it returns.
@@ -539,6 +553,17 @@
 +            return fn()
 +        if threading.current_thread() is affinity:
 +            return fn()
++        # DIAGNOSTIC: log cross-thread store hops (thread + caller) so a
++        # WasmtimeError can be traced to the exact unwrapped path.
++        try:
++            if os.environ.get("QJS_AFFINITY_DEBUG"):
++                with open("/tmp/qjs_affinity_debug.log", "a") as _df:
++                    _df.write(
++                        f"{time.time():.3f} hop from={threading.current_thread().name} "
++                        f"to=affinity caller={self._affinity_caller()}\n"
++                    )
++        except Exception:
++            pass
 +        # Cross-thread: hop onto the persistent affinity thread.
 +        with self._wasmtime_affinity_lock:
 +            if self._affinity_thread is None or not self._affinity_thread.is_alive():
