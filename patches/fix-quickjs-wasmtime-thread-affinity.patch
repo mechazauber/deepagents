@@ -269,7 +269,173 @@
  
      def _raise_classified(
          self,
-@@ -931,11 +962,13 @@
+@@ -675,22 +706,29 @@
+           JS_EVAL_FLAG_ASYNC (``promise=True``). Result is a Promise that resolves to the
+           ``{value, done}`` envelope.
+         """
+-        try:
++        # Store access — hop onto the owning thread (no-op when the
++        # caller is already on it). The async eval entry points
++        # (eval_module_async / eval_handle with promise=True) touch the
++        # Wasmtime store, so they must run on the affinity thread just
++        # like the sync eval path.
++        def _eval() -> Any:
+             if module:
+-                inner = self._engine_ctx.eval_module_async(
++                return self._engine_ctx.eval_module_async(
+                     code,
+                     filename=filename,
+                     transform_flags=transform_flags,
+                 )
+-            else:
+-                inner = self._engine_ctx.eval_handle(
+-                    code,
+-                    module=False,
+-                    strict=strict,
+-                    promise=True,
+-                    filename=filename,
+-                    transform_flags=transform_flags,
+-                )
++            return self._engine_ctx.eval_handle(
++                code,
++                module=False,
++                strict=strict,
++                promise=True,
++                filename=filename,
++                transform_flags=transform_flags,
++            )
++
++        try:
++            inner = self._on_wasmtime_thread(_eval)
+         except _engine.JSError as e:
+             name, message, stack = e.args
+             self._raise_classified(name, message, stack, deadline)
+@@ -755,17 +793,29 @@
+                         return fast
+                     try:
+                         while True:
+-                            # Step 1: drain microtasks first.
+-                            self._engine_ctx.run_pending_jobs()
+-
+-                            # Step 2: check promise state.
+-                            state = self._engine_ctx.promise_state(handle._require_live())
++                            # Store access (drain + state) — hop onto the
++                            # owning thread. The `await event.wait()` below
++                            # stays OUTSIDE the affinity lock (the lock is
++                            # only held during affinity-thread setup), so
++                            # suspending here never deadlocks the affinity
++                            # thread.
++                            def _drain_and_state() -> tuple[None, int]:
++                                self._engine_ctx.run_pending_jobs()
++                                return None, self._engine_ctx.promise_state(
++                                    handle._require_live()
++                                )
++
++                            _drained, state = self._on_wasmtime_thread(_drain_and_state)
+ 
+                             # Step 3: fulfilled → return result.
+                             if state == 1:
+-                                result_handle = Handle(
+-                                    self,
+-                                    self._engine_ctx.promise_result(handle._require_live()),
++                                result_handle = self._on_wasmtime_thread(
++                                    lambda: Handle(
++                                        self,
++                                        self._engine_ctx.promise_result(
++                                            handle._require_live()
++                                        ),
++                                    )
+                                 )
+                                 handle.dispose()
+                                 handle = None
+@@ -773,9 +823,13 @@
+ 
+                             # Step 4: rejected → raise from reason.
+                             if state == 2:
+-                                reason_handle = Handle(
+-                                    self,
+-                                    self._engine_ctx.promise_result(handle._require_live()),
++                                reason_handle = self._on_wasmtime_thread(
++                                    lambda: Handle(
++                                        self,
++                                        self._engine_ctx.promise_result(
++                                            handle._require_live()
++                                        ),
++                                    )
+                                 )
+                                 try:
+                                     self._raise_from_reason_handle(reason_handle, deadline)
+@@ -793,17 +847,21 @@
+                                     # in the future.
+                                     stuck = self._failed_settles
+                                     self._failed_settles = {}
+-                                    for pid, exc in stuck.items():
+-                                        self._last_host_exception = exc
+-                                        try:
+-                                            self._engine_ctx.reject_pending(
+-                                                pid,
+-                                                "HostError",
+-                                                _HOST_ERROR_SANITIZED_MESSAGE,
+-                                                None,
+-                                            )
+-                                        except Exception:
+-                                            pass
++
++                                    def _reject_stuck() -> None:
++                                        for pid, exc in stuck.items():
++                                            self._last_host_exception = exc
++                                            try:
++                                                self._engine_ctx.reject_pending(
++                                                    pid,
++                                                    "HostError",
++                                                    _HOST_ERROR_SANITIZED_MESSAGE,
++                                                    None,
++                                                )
++                                            except Exception:
++                                                pass
++
++                                    self._on_wasmtime_thread(_reject_stuck)
+                                     continue
+                                 raise DeadlockError(
+                                     "eval_async's top-level promise "
+@@ -844,19 +902,26 @@
+                 # so a raise here cannot capture them in the
+                 # traceback and trip the cross-thread drop check.
+                 try:
+-                    self._engine_ctx.run_pending_jobs()
+-                    state = self._engine_ctx.promise_state(handle._require_live())
++                    # Store access — hop onto the owning thread.
++                    def _inspect() -> tuple[int, Any]:
++                        self._engine_ctx.run_pending_jobs()
++                        state = self._engine_ctx.promise_state(handle._require_live())
++                        if state == 1:
++                            return state, self._engine_ctx.promise_result(
++                                handle._require_live()
++                            )
++                        if state == 2:
++                            return state, self._engine_ctx.promise_result(
++                                handle._require_live()
++                            )
++                        return state, None
++
++                    state, result_or_reason = self._on_wasmtime_thread(_inspect)
+                     if state == 1:
+-                        absorbed_handle = Handle(
+-                            self,
+-                            self._engine_ctx.promise_result(handle._require_live()),
+-                        )
++                        absorbed_handle = Handle(self, result_or_reason)
+                         handle.dispose()
+                     elif state == 2:
+-                        reason_handle = Handle(
+-                            self,
+-                            self._engine_ctx.promise_result(handle._require_live()),
+-                        )
++                        reason_handle = Handle(self, result_or_reason)
+                         try:
+                             is_our_cancel = self._handle_name_is(
+                                 reason_handle, "HostCancellationError"
+@@ -931,11 +996,13 @@
          """
          for pid in list(self._pending_tasks):
              try:
@@ -288,7 +454,7 @@
                  )
              except Exception:
                  # Best-effort: a pid may have been settled between
-@@ -968,6 +1001,12 @@
+@@ -968,6 +1035,12 @@
          if self._pending_completed is None:
              self._pending_completed = asyncio.Event()
  
@@ -301,7 +467,7 @@
          coro = self._run_async_host_call(fn, args, pending_id)
          if self._active_task_group is not None:
              task = self._active_task_group.create_task(coro)
-@@ -1020,9 +1059,15 @@
+@@ -1020,9 +1093,15 @@
  
              try:
                  if resolve_ok:
@@ -319,7 +485,7 @@
              except Exception as settle_exc:
                  # The promise was not settled. Two causes are genuinely benign:
                  #   1. the context closed under us
-@@ -1038,8 +1083,11 @@
+@@ -1038,8 +1117,11 @@
                  if resolve_ok:
                      # Retry once for potential transient failures
                      try:
@@ -333,7 +499,7 @@
                          settled = True
                      except Exception:
                          # Still can't deliver the result. Store the original
-@@ -1047,8 +1095,10 @@
+@@ -1047,8 +1129,10 @@
                          self._last_host_exception = settle_exc
                  if not settled:
                      try:
@@ -346,7 +512,7 @@
                          )
                          settled = True
                      except Exception:
-@@ -1063,6 +1113,61 @@
+@@ -1063,6 +1147,61 @@
              if self._pending_completed is not None:
                  self._pending_completed.set()
  
