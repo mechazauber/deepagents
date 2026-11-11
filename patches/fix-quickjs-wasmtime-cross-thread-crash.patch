@@ -1,0 +1,67 @@
+# Patch: fix quickjs_rs Wasmtime cross-thread crash
+#
+# Target: quickjs_rs/_engine.py (PyPI package quickjs-rs>=0.2.6,<0.3.0)
+#
+# The 4 host-function trampolines registered ONCE on the process-shared
+# Wasmtime Linker read `_CUR.inst` (a thread-local) without a null check.
+# When a `js_eval` script calls `task()` (subagent), the subagent's Wasmtime
+# work runs on a DIFFERENT thread (the outer LangGraph loop), where `_CUR.inst`
+# is `None`. The old code `cast("_Instance", _CUR.inst)._host_call(...)` raises
+# `AttributeError: 'NoneType' object has no attribute '_host_call'`, which
+# propagates up through Wasmtime's trampoline (wasmtime/_func.py:208) and is
+# caught as a generic `WasmtimeError("An internal error occurred")`, killing
+# the session.
+#
+# Fix: use `getattr(_CUR, "inst", None)` and return `0` (no-op) when `inst is
+# None`. A host import firing on a thread with no active instance is a
+# no-op (the guest's hot-loop poll / module loader has nothing to route to).
+#
+# How to apply:
+#   cd <your-dcode-install>/lib/python3.14/site-packages
+#   patch -p1 < /path/to/fix-quickjs-wasmtime-cross-thread-crash.patch
+#
+# Or manually edit quickjs_rs/_engine.py: replace each of the 4 trampoline
+# bodies with the `getattr` + null-check version shown below.
+
+--- a/quickjs_rs/_engine.py
++++ b/quickjs_rs/_engine.py
+@@ -222,23 +222,35 @@ _CUR = threading.local()
+ # The method bodies (and their bound-checked reads /
+ # host-error sanitization) stay on `_Instance`; these shims only route.
+ def _tramp_host_call(name_ptr: int, name_len: int, this: int, argc: int, argv_ptr: int) -> int:
+-    return cast("_Instance", _CUR.inst)._host_call(name_ptr, name_len, this, argc, argv_ptr)
++    inst = getattr(_CUR, "inst", None)
++    if inst is None:
++        return 0
++    return inst._host_call(name_ptr, name_len, this, argc, argv_ptr)
+
+
+ def _tramp_host_interrupt() -> int:
+-    return cast("_Instance", _CUR.inst)._host_interrupt()
++    inst = getattr(_CUR, "inst", None)
++    if inst is None:
++        return 0
++    return inst._host_interrupt()
+
+
+ def _tramp_host_module_normalize(
+     base_ptr: int, base_len: int, spec_ptr: int, spec_len: int, out_len_ptr: int
+ ) -> int:
+-    return cast("_Instance", _CUR.inst)._host_module_normalize(
++    inst = getattr(_CUR, "inst", None)
++    if inst is None:
++        return 0
++    return inst._host_module_normalize(
+         base_ptr, base_len, spec_ptr, spec_len, out_len_ptr
+     )
+
+
+ def _tramp_host_module_load(name_ptr: int, name_len: int, out_len_ptr: int) -> int:
+-    return cast("_Instance", _CUR.inst)._host_module_load(name_ptr, name_len, out_len_ptr)
++    inst = getattr(_CUR, "inst", None)
++    if inst is None:
++        return 0
++    return inst._host_module_load(name_ptr, name_len, out_len_ptr)
+
+
+ def _build_shared_linker(engine: wasmtime.Engine) -> wasmtime.Linker:
