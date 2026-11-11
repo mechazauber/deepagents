@@ -1,0 +1,22 @@
+--- qrs_orig/installed/quickjs_rs/_wasmtime.py	2026-11-11 16:34:29.476594707 +0000
++++ /sandbox/.local/share/uv/tools/deepagents-code/lib/python3.14/site-packages/quickjs_rs/_wasmtime.py	2026-11-11 16:32:53.977071820 +0000
+@@ -29,7 +29,18 @@
+     if _SHARED_ENGINE is None:
+         with _SHARED_ENGINE_LOCK:
+             if _SHARED_ENGINE is None:
+-                _SHARED_ENGINE = wasmtime.Engine()
++                # Disable copy-on-write memory-mapped data for linear-memory
++                # initialization. With the default (cow=True), wasmtime backs
++                # data-section initialization with a memfd (memfd_create
++                # syscall) on Linux. In sandboxes that block memfd_create
++                # (EPERM) or restrict /dev/shm, instantiation fails with
++                # "WasmtimeError: cannot create a memfd". Setting
++                # memory_init_cow=False makes wasmtime initialize linear
++                # memory without a memfd, so the artifact instantiates
++                # regardless of the sandbox's memfd policy.
++                cfg = wasmtime.Config()
++                cfg.memory_init_cow = False
++                _SHARED_ENGINE = wasmtime.Engine(cfg)
+     return _SHARED_ENGINE
+ 
+ 
